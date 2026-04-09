@@ -1,11 +1,21 @@
 # ONNX Debugger
 
-A command-line tool for debugging ONNX models by capturing and visualizing intermediate tensor values at every node during inference.
+A comprehensive command-line tool for debugging ONNX models by capturing and visualizing intermediate tensor values at every node during inference.
 
 ## Features
 
 - **Full Tensor Capture**: Runs inference with all intermediate outputs exposed, capturing shapes, data types, and statistics for every tensor.
-- **HTML Report Generation**: Produces an interactive HTML report showing the model graph with detailed tensor information.
+- **Interactive HTML Report**: Produces a feature-rich HTML report with three visualization modes:
+  - **Debug View**: Detailed node-by-node tensor inspection with statistics
+  - **Graph View**: Interactive computational graph visualization with SVG rendering
+  - **Statistics**: Comprehensive operator statistics and model analysis
+- **Graph Visualization**: Interactive computational graph with:
+  - SVG-based rendering with pan and zoom support
+  - Topological layout algorithm for clear visualization
+  - Smart edge routing to avoid crossings
+  - Node search and filtering
+  - Click-to-inspect node details
+  - Color-coded operator categories
 - **Node Inspection**: Allows detailed inspection of individual nodes' input/output tensors.
 - **JSON Export**: Optional export of raw debug data to JSON format.
 - **ONNX Compatibility**: Works with standard ONNX models and supports various input formats.
@@ -31,26 +41,31 @@ pip install onnx onnxruntime numpy
 ### Basic Usage
 
 ```bash
-python cli.py <model.onnx> <input.npy>
+python onnx_visualnode.py <model.onnx> <input.npy>
 ```
 
 This will generate an HTML debug report with the default name `<model>_debug.html`.
+
+**Note**: You can also use the modular version:
+```bash
+python cli.py <model.onnx> <input.npy>
+```
 
 ### Advanced Options
 
 - **Specify Output File**:
   ```bash
-  python cli.py resnet18.onnx input.npy --output custom_report.html
+  python onnx_visualnode.py resnet18.onnx input.npy --output custom_report.html
   ```
 
 - **Inspect a Specific Node**:
   ```bash
-  python cli.py resnet18.onnx input.npy --inspect Conv_0
+  python onnx_visualnode.py resnet18.onnx input.npy --inspect Conv_0
   ```
 
 - **Export Raw Data to JSON**:
   ```bash
-  python cli.py resnet18.onnx input.npy --json
+  python onnx_visualnode.py resnet18.onnx input.npy --json
   ```
 
 ### Command Line Arguments
@@ -84,11 +99,30 @@ np.save('inputs.npy', inputs)
 
 ### HTML Report
 
-The HTML report provides:
-- Interactive model graph visualization
+The HTML report provides three interactive visualization modes:
+
+#### 1. Debug View
+- List of all nodes with operation types
 - Per-node tensor details (shapes, data types, statistics)
 - Min/max values, means, and standard deviations for each tensor
 - Node operation types and attributes
+- Search and filter functionality
+
+#### 2. Graph View
+- Interactive SVG-based computational graph visualization
+- Topological layout with clear data flow
+- Pan (drag) and zoom (scroll) controls
+- Click nodes to view detailed information
+- Smart edge routing to minimize crossings
+- Color-coded operator categories
+- Node search and filtering
+- Legend showing operator types
+
+#### 3. Statistics
+- Total node count and unique operator types
+- Operator breakdown with counts and percentages
+- Visual bar charts for operator distribution
+- Model metadata and analysis timestamp
 
 ### JSON Export
 
@@ -99,6 +133,12 @@ When using `--json`, exports a structured dictionary containing:
 
 ## Project Structure
 
+### Single-File Version (Recommended)
+```
+onnx_visualnode.py       # All-in-one single file version with all features
+```
+
+### Modular Version
 ```
 onnx_debugger/
 ├── debugger.py          # Main debugger interface

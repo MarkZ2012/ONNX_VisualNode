@@ -300,6 +300,298 @@ def _cat(op_type):
     return OP_CATEGORY.get(op_type, "other")
 
 
+def _build_graph_data(debug_result: dict, model: onnx.ModelProto = None):
+    """
+    从debug_result构建图形视图所需的nodes_data和edges
+    返回: (nodes_data, edges)
+    """
+    nodes_data = []
+    edges = []
+    
+    # 建立tensor name到node id的映射
+    tensor_to_node = {}
+    
+    # 收集所有输入tensor(模型输入)
+    all_input_tensors = set()
+    all_output_tensors = set()
+    all_intermediate_tensors = set()
+    
+    # 第一步：收集所有tensor信息
+    for idx, (node_id, nd) in enumerate(debug_result.items()):
+        for inp_name in nd.get("inputs", {}).keys():
+            if inp_name:
+                all_input_tensors.add(inp_name)
+        for out_name in nd.get("outputs", {}).keys():
+            if out_name:
+                all_output_tensors.add(out_name)
+                all_intermediate_tensors.add(out_name)
+    
+    # 从ONNX模型获取真正的输入(排除initializer中的权重参数)
+    model_inputs = set()
+    if model is not None:
+        # 获取所有initializer(权重参数)的名称
+        initializer_names = {init.name for init in model.graph.initializer}
+        # 真正的模型输入 = graph.input - initializer
+        for input_info in model.graph.input:
+            if input_info.name not in initializer_names:
+                model_inputs.add(input_info.name)
+    else:
+        # 如果没有model对象,使用旧逻辑作为fallback
+        model_inputs = all_input_tensors - all_intermediate_tensors
+    # 模型输出 = 所有输出tensor中不被其他节点使用的
+    model_outputs = set()
+    for out_name in all_output_tensors:
+        is_used = False
+        for node_id, nd in debug_result.items():
+            if out_name in nd.get("inputs", {}).keys():
+                is_used = True
+                break
+        if not is_used:
+            model_outputs.add(out_name)
+    
+    # 第二步：创建input节点
+    input_node_id = 0
+    input_tensor_to_node = {}
+
+    # 从ONNX模型获取输入元数据
+    input_metadata = {}
+    if model is not None:
+        initializer_names = {init.name for init in model.graph.initializer}
+        for input_info in model.graph.input:
+            if input_info.name not in initializer_names:
+                # 提取shape和dtype信息
+                shape = []
+                dtype_str = "unknown"
+                if input_info.type.tensor_type:
+                    tt = input_info.type.tensor_type
+                    # 获取shape
+                    for dim in tt.shape.dim:
+                        if dim.dim_value:
+                            shape.append(dim.dim_value)
+                        elif dim.dim_param:
+                            shape.append(dim.dim_param)
+                        else:
+                            shape.append(-1)
+                    # 获取dtype
+                    if tt.elem_type:
+                        from onnx import TensorProto
+                        dtype_map = {
+                            TensorProto.FLOAT: "float32",
+                            TensorProto.DOUBLE: "float64",
+                            TensorProto.INT32: "int32",
+                            TensorProto.INT64: "int64",
+                            TensorProto.UINT8: "uint8",
+                            TensorProto.INT8: "int8",
+                            TensorProto.UINT16: "uint16",
+                            TensorProto.INT16: "int16",
+                            TensorProto.BOOL: "bool",
+                        }
+                        dtype_str = dtype_map.get(tt.elem_type, f"type_{tt.elem_type}")
+                input_metadata[input_info.name] = {"shape": shape, "dtype": dtype_str}
+
+    for tensor_name in sorted(model_inputs):
+        # 优先从ONNX模型元数据获取shape
+        shape_str = "?"
+        attrs = {}
+        if tensor_name in input_metadata:
+            meta = input_metadata[tensor_name]
+            shape = meta.get("shape", [])
+            if shape:
+                shape_str = "[" + ", ".join(str(d) for d in shape) + "]"
+            attrs["dtype"] = meta.get("dtype", "unknown")
+            attrs["shape"] = shape_str
+        else:
+            # fallback: 从debug_result获取
+            for node_id, nd in debug_result.items():
+                if tensor_name in nd.get("inputs", {}):
+                    tensor_info = nd["inputs"][tensor_name]
+                    shape = tensor_info.get("shape", [])
+                    if shape:
+                        shape_str = "[" + ", ".join(str(d) for d in shape) + "]"
+                    if tensor_info.get("dtype"):
+                        attrs["dtype"] = tensor_info["dtype"]
+                    attrs["shape"] = shape_str
+                    break
+
+        nodes_data.append({
+            "id": input_node_id,
+            "name": tensor_name[:40],
+            "op": "Input",
+            "category": "input",
+            "inputs": [],
+            "outputs": [tensor_name],
+            "input_shapes": [],
+            "output_shapes": [{"name": tensor_name[:40], "shape": shape_str}],
+            "attrs": attrs,
+        })
+        input_tensor_to_node[tensor_name] = input_node_id
+        input_node_id += 1
+    
+    # 第三步：创建所有算子节点
+    for idx, (node_id, nd) in enumerate(debug_result.items()):
+        nid = idx + input_node_id  # 偏移input节点数量
+        
+        # 收集输入输出形状信息
+        input_shapes = []
+        for name, tensor_info in nd.get("inputs", {}).items():
+            # 即使tensor不可用,也尝试获取shape信息
+            shape = tensor_info.get("shape", [])
+            if shape:
+                shape_str = "[" + ", ".join(str(d) for d in shape) + "]"
+            else:
+                shape_str = "?"
+            input_shapes.append({"name": name[:40], "shape": shape_str})
+        
+        output_shapes = []
+        for name, tensor_info in nd.get("outputs", {}).items():
+            # 即使tensor不可用,也尝试获取shape信息
+            shape = tensor_info.get("shape", [])
+            if shape:
+                shape_str = "[" + ", ".join(str(d) for d in shape) + "]"
+            else:
+                shape_str = "?"
+            output_shapes.append({"name": name[:40], "shape": shape_str})
+        
+        nodes_data.append({
+            "id": nid,
+            "name": node_id,
+            "op": nd["op_type"],
+            "category": _cat(nd["op_type"]),
+            "inputs": list(nd.get("inputs", {}).keys()),
+            "outputs": list(nd.get("outputs", {}).keys()),
+            "input_shapes": input_shapes,
+            "output_shapes": output_shapes,
+            "attrs": nd.get("attrs", {}),
+        })
+        
+        # 记录输出tensor到node的映射
+        for out_name in nd.get("outputs", {}).keys():
+            tensor_to_node[out_name] = nid
+    
+    # 第四步：创建output节点
+    output_node_start_id = len(nodes_data)
+    output_tensor_to_node = {}
+
+    # 从ONNX模型获取输出元数据
+    output_metadata = {}
+    if model is not None:
+        for output_info in model.graph.output:
+            # 提取shape和dtype信息
+            shape = []
+            dtype_str = "unknown"
+            if output_info.type.tensor_type:
+                tt = output_info.type.tensor_type
+                # 获取shape
+                for dim in tt.shape.dim:
+                    if dim.dim_value:
+                        shape.append(dim.dim_value)
+                    elif dim.dim_param:
+                        shape.append(dim.dim_param)
+                    else:
+                        shape.append(-1)
+                # 获取dtype
+                if tt.elem_type:
+                    from onnx import TensorProto
+                    dtype_map = {
+                        TensorProto.FLOAT: "float32",
+                        TensorProto.DOUBLE: "float64",
+                        TensorProto.INT32: "int32",
+                        TensorProto.INT64: "int64",
+                        TensorProto.UINT8: "uint8",
+                        TensorProto.INT8: "int8",
+                        TensorProto.UINT16: "uint16",
+                        TensorProto.INT16: "int16",
+                        TensorProto.BOOL: "bool",
+                    }
+                    dtype_str = dtype_map.get(tt.elem_type, f"type_{tt.elem_type}")
+            output_metadata[output_info.name] = {"shape": shape, "dtype": dtype_str}
+
+    for tensor_name in sorted(model_outputs):
+        # 优先从ONNX模型元数据获取shape
+        shape_str = "?"
+        attrs = {}
+        if tensor_name in output_metadata:
+            meta = output_metadata[tensor_name]
+            shape = meta.get("shape", [])
+            if shape:
+                shape_str = "[" + ", ".join(str(d) for d in shape) + "]"
+            attrs["dtype"] = meta.get("dtype", "unknown")
+            attrs["shape"] = shape_str
+        else:
+            # fallback: 从debug_result获取
+            for node_id, nd in debug_result.items():
+                if tensor_name in nd.get("outputs", {}):
+                    tensor_info = nd["outputs"][tensor_name]
+                    shape = tensor_info.get("shape", [])
+                    if shape:
+                        shape_str = "[" + ", ".join(str(d) for d in shape) + "]"
+                    if tensor_info.get("dtype"):
+                        attrs["dtype"] = tensor_info["dtype"]
+                    attrs["shape"] = shape_str
+                    break
+
+        output_node_id = output_node_start_id + len(output_tensor_to_node)
+        nodes_data.append({
+            "id": output_node_id,
+            "name": tensor_name[:40],
+            "op": "Output",
+            "category": "output",
+            "inputs": [tensor_name],
+            "outputs": [],
+            "input_shapes": [{"name": tensor_name[:40], "shape": shape_str}],
+            "output_shapes": [],
+            "attrs": attrs,
+        })
+        output_tensor_to_node[tensor_name] = output_node_id
+    
+    # 第五步：构建边（基于tensor依赖关系）
+    seen_edges = set()
+    
+    # 从input节点到第一个使用它的算子节点
+    for tensor_name, src_id in input_tensor_to_node.items():
+        for idx, (node_id, nd) in enumerate(debug_result.items()):
+            if tensor_name in nd.get("inputs", {}).keys():
+                dst_id = idx + input_node_id
+                edge_key = (src_id, dst_id, tensor_name)
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "src": src_id,
+                        "dst": dst_id,
+                        "tensor": tensor_name[:40]
+                    })
+    
+    # 算子节点之间的边
+    for idx, (node_id, nd) in enumerate(debug_result.items()):
+        dst_id = idx + input_node_id
+        for inp_name in nd.get("inputs", {}).keys():
+            if inp_name in tensor_to_node:
+                src_id = tensor_to_node[inp_name]
+                edge_key = (src_id, dst_id, inp_name)
+                if edge_key not in seen_edges and src_id != dst_id:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "src": src_id,
+                        "dst": dst_id,
+                        "tensor": inp_name[:40]
+                    })
+    
+    # 从算子节点到output节点
+    for tensor_name, dst_id in output_tensor_to_node.items():
+        if tensor_name in tensor_to_node:
+            src_id = tensor_to_node[tensor_name]
+            edge_key = (src_id, dst_id, tensor_name)
+            if edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+                edges.append({
+                    "src": src_id,
+                    "dst": dst_id,
+                    "tensor": tensor_name[:40]
+                })
+    
+    return nodes_data, edges
+
+
 def build_html(
     debug_result: dict,
     model_path: str,
@@ -312,6 +604,8 @@ def build_html(
     npy_path      – 输入.npy路径(用于显示)
     output_path   – .html文件写入位置
     """
+    # 加载模型以获取正确的输入信息
+    model = onnx.load(model_path)
 
     # 为每个节点字典添加id和category以便JS使用
     nodes_list = []
@@ -326,11 +620,16 @@ def build_html(
         }
         nodes_list.append(entry)
 
+    # 准备图形视图数据 (nodes_data 和 edges)
+    nodes_data, edges = _build_graph_data(debug_result, model)
+
     data_json = _safe_json({
         "model":    os.path.basename(model_path),
         "npy":      os.path.basename(npy_path),
         "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "nodes":    nodes_list,
+        "graph_nodes": nodes_data,
+        "graph_edges": edges,
     })
 
     html = _render_html(data_json, os.path.basename(model_path))
@@ -348,7 +647,7 @@ def _render_html(data_json: str, model_name: str) -> str:  # noqa: C901
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ONNX Debugger – {model_name}</title>
+<title>ONNX Debugger - {model_name}</title>
 <style>
 :root{{
   --bg:#0d1117;--panel:#161b22;--panel2:#1f2937;--border:#2d3748;
@@ -459,6 +758,52 @@ header{{background:var(--panel);border-bottom:1px solid var(--border);
 .op-table tr:hover td{{background:var(--panel)}}
 .bar-bg{{background:var(--panel2);border-radius:4px;height:5px;min-width:80px}}
 .bar-fill{{height:5px;border-radius:4px}}
+
+/* ── graph tab ── */
+#graph-panel{{display:none;flex:1;overflow:hidden;position:relative;background:var(--bg)}}
+#graph-panel.active{{display:flex}}
+#canvas-wrap{{flex:1;position:relative;overflow:hidden;cursor:grab}}
+#canvas-wrap.grabbing{{cursor:grabbing}}
+svg#graph-svg{{width:100%;height:100%}}
+.node-group{{cursor:pointer;transition:filter .15s}}
+.node-group:hover{{filter:brightness(1.3)}}
+.node-rect{{rx:8;ry:8;stroke-width:1.5}}
+.node-op{{font-size:12px;font-weight:700;fill:#fff;text-anchor:middle;dominant-baseline:central;pointer-events:none}}
+.node-name{{font-size:9px;fill:rgba(255,255,255,0.6);text-anchor:middle;pointer-events:none}}
+.edge-path{{fill:none;stroke:#3a3f5c;stroke-width:1.2;marker-end:url(#arrow);opacity:0.6}}
+.edge-path.highlighted{{stroke:var(--accent);opacity:1;stroke-width:2}}
+.node-rect.selected{{stroke:#fff;stroke-width:3;filter:drop-shadow(0 0 8px var(--accent))}}
+
+.graph-controls{{position:absolute;bottom:16px;left:16px;display:flex;flex-direction:column;gap:6px}}
+.ctrl-btn{{background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);
+          width:32px;height:32px;cursor:pointer;font-size:16px;display:flex;align-items:center;
+          justify-content:center;transition:background .2s}}
+.ctrl-btn:hover{{background:var(--panel2)}}
+.graph-search{{position:absolute;top:12px;left:12px}}
+#graph-search{{background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);
+              padding:6px 12px;font-size:13px;width:220px;outline:none}}
+#graph-search:focus{{border-color:var(--accent)}}
+
+.graph-legend{{position:absolute;top:12px;right:12px;background:rgba(22,27,34,0.92);
+              border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:11px;
+              display:flex;flex-direction:column;gap:4px}}
+.legend-item{{display:flex;align-items:center;gap:6px}}
+.legend-dot{{width:10px;height:10px;border-radius:3px;flex-shrink:0}}
+
+#graph-detail-panel{{width:320px;background:var(--panel);border-left:1px solid var(--border);
+                    display:none;flex-direction:column;flex-shrink:0;overflow:hidden;position:absolute;right:0;top:0;bottom:0;z-index:10}}
+#graph-detail-panel.visible{{display:flex}}
+.panel-header{{padding:12px 16px;border-bottom:1px solid var(--border);font-size:13px;
+              font-weight:600;color:var(--text2);display:flex;align-items:center;justify-content:space-between}}
+.panel-content{{flex:1;overflow-y:auto;padding:12px}}
+.panel-content::-webkit-scrollbar{{width:4px}}
+.panel-content::-webkit-scrollbar-thumb{{background:var(--border);border-radius:2px}}
+.section-title{{font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;
+              letter-spacing:1px;margin:12px 0 6px}}
+.tensor-item{{background:var(--panel2);border-radius:6px;padding:6px 10px;margin-bottom:4px;font-size:11px}}
+.attr-item{{display:flex;gap:6px;font-size:11px;margin-bottom:4px}}
+.attr-key{{color:var(--warn);min-width:80px;flex-shrink:0}}
+.attr-val{{color:var(--text);word-break:break-all}}
 </style>
 </head>
 <body>
@@ -470,12 +815,13 @@ header{{background:var(--panel);border-bottom:1px solid var(--border);
   <div class="hchip">Time <span id="h-time">—</span></div>
   <div class="tabs">
     <div class="tab active" id="tab-debug" onclick="switchTab('debug')">Debug View</div>
+    <div class="tab" id="tab-graph" onclick="switchTab('graph')">Graph View</div>
     <div class="tab" id="tab-stats" onclick="switchTab('stats')">Statistics</div>
   </div>
 </header>
 
 <div class="main">
-  <!-- left: node list -->
+  <!-- left: node list (for debug view) -->
   <div id="list-panel">
     <div id="search-wrap">
       <input id="node-search" type="text" placeholder="🔍 Filter nodes…">
@@ -483,18 +829,54 @@ header{{background:var(--panel);border-bottom:1px solid var(--border);
     <div id="node-list"></div>
   </div>
 
-  <!-- right: detail + stats -->
+  <!-- right: detail + stats + graph -->
   <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
     <div id="detail-panel">
       <div class="no-sel">← Select a node to inspect its tensors</div>
     </div>
     <div id="stats-panel"></div>
+    <div id="graph-panel">
+      <div id="canvas-wrap">
+        <svg id="graph-svg">
+          <defs>
+            <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#3a3f5c"/>
+            </marker>
+            <marker id="arrow-hl" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="var(--accent)"/>
+            </marker>
+          </defs>
+          <g id="graph-root"></g>
+        </svg>
+      </div>
+      <div class="graph-search">
+        <input id="graph-search" type="text" placeholder="🔍 Search nodes...">
+      </div>
+      <div class="graph-controls">
+        <button class="ctrl-btn" title="Zoom In" onclick="zoomBy(1.25)">+</button>
+        <button class="ctrl-btn" title="Zoom Out" onclick="zoomBy(0.8)">−</button>
+        <button class="ctrl-btn" title="Fit View" onclick="fitView()" style="font-size:13px">⛶</button>
+        <button class="ctrl-btn" title="Toggle Panel" onclick="toggleGraphPanel()" style="font-size:13px">☰</button>
+      </div>
+      <div class="graph-legend" id="legend-panel"></div>
+      <div id="graph-detail-panel" class="hidden">
+        <div class="panel-header">
+          <span>Node Details</span>
+          <span style="font-size:10px;cursor:pointer;color:var(--text2)" onclick="toggleGraphPanel()">✕</span>
+        </div>
+        <div class="panel-content" id="graph-node-detail">
+          <div class="no-sel">Click a node to view details</div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
 <script>
 const RAW = {data_json};
 const nodes = RAW.nodes;
+const graphNodes = RAW.graph_nodes || [];
+const graphEdges = RAW.graph_edges || [];
 
 // ── colour map ──────────────────────────────────────────────────────────────
 const CAT_COLOR = {{
@@ -505,7 +887,8 @@ const CAT_COLOR = {{
 const CAT_LABEL = {{
   conv:"Conv",gemm:"FC/MatMul",act:"Activation",pool:"Pooling",
   norm:"Normalization",eltwise:"Element-wise",shape:"Shape Ops",
-  upsample:"Upsample",rnn:"RNN",reduce:"Reduce",attention:"Attention",other:"Other"
+  upsample:"Upsample",rnn:"RNN",reduce:"Reduce",attention:"Attention",
+  input:"输入",output:"输出",other:"Other"
 }};
 function catColor(c){{ return CAT_COLOR[c]||"#6b7280"; }}
 
@@ -513,6 +896,10 @@ function catColor(c){{ return CAT_COLOR[c]||"#6b7280"; }}
 document.getElementById("h-model").textContent = RAW.model + "  ·  " + RAW.npy;
 document.getElementById("h-nodes").textContent = nodes.length;
 document.getElementById("h-time").textContent  = RAW.time;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEBUG VIEW
+// ═══════════════════════════════════════════════════════════════════════════
 
 // ── build node list ─────────────────────────────────────────────────────────
 function buildList(filter){{
@@ -619,7 +1006,10 @@ function renderDetail(nd){{
   document.getElementById("detail-panel").innerHTML = html;
 }}
 
-// ── statistics tab ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// STATISTICS TAB
+// ═══════════════════════════════════════════════════════════════════════════
+
 function buildStats(){{
   const counter = {{}};
   nodes.forEach(nd=>{{ counter[nd.op_type] = (counter[nd.op_type]||0)+1; }});
@@ -659,14 +1049,440 @@ function buildStats(){{
   document.getElementById("stats-panel").innerHTML = html;
 }}
 
-// ── tab switch ───────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// GRAPH VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+
+const NODE_W = 130, NODE_H = 46, LEVEL_GAP = 80, COL_GAP = 150;
+
+function computeLayout(nodes, edges) {{
+  const n = nodes.length;
+  if(n === 0) return;
+
+  const idToIdx = {{}};
+  nodes.forEach((nd, i) => idToIdx[nd.id] = i);
+
+  const inDeg = new Array(n).fill(0);
+  const adj = Array.from({{length: n}}, () => []);
+
+  edges.forEach(e => {{
+    const si = idToIdx[e.src], di = idToIdx[e.dst];
+    if(si === undefined || di === undefined || si === di) return;
+    adj[si].push(di);
+    inDeg[di]++;
+  }});
+
+  const level = new Array(n).fill(0);
+  const queue = [];
+  for(let i=0;i<n;i++) if(inDeg[i]===0) queue.push(i);
+
+  const topo = [];
+  const visited = new Array(n).fill(false);
+  let qi = 0;
+  while(qi < queue.length) {{
+    const u = queue[qi++];
+    topo.push(u);
+    visited[u] = true;
+    adj[u].forEach(v => {{
+      level[v] = Math.max(level[v], level[u]+1);
+      inDeg[v]--;
+      if(inDeg[v] === 0) queue.push(v);
+    }});
+  }}
+  for(let i=0;i<n;i++) if(!visited[i]) {{ topo.push(i); }}
+
+  const maxLevel = Math.max(...level, 0);
+  const levelGroups = Array.from({{length: maxLevel+1}}, () => []);
+  topo.forEach(i => levelGroups[level[i]].push(i));
+
+  nodes.forEach((nd, i) => {{
+    const lv = level[i];
+    const grp = levelGroups[lv];
+    const posInGrp = grp.indexOf(i);
+    const totalInGrp = grp.length;
+    nd._w = NODE_W; nd._h = NODE_H;
+    nd._level = lv;
+    nd.y = lv * (NODE_H + LEVEL_GAP) + 40;
+    nd.x = (posInGrp - (totalInGrp-1)/2) * (NODE_W + COL_GAP);
+  }});
+
+  nodes._levelGroups = levelGroups;
+  nodes._idToIdx = idToIdx;
+  nodes._level = level;
+}}
+
+computeLayout(graphNodes, graphEdges);
+
+// center offset
+let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+graphNodes.forEach(nd => {{
+  if(nd.x !== undefined) {{
+    minX = Math.min(minX, nd.x); minY = Math.min(minY, nd.y);
+    maxX = Math.max(maxX, nd.x + NODE_W); maxY = Math.max(maxY, nd.y + NODE_H);
+  }}
+}});
+const graphW = maxX - minX + NODE_W*2;
+const graphH = maxY - minY + NODE_H*2;
+const offsetX = -minX + NODE_W;
+const offsetY = -minY + NODE_H;
+graphNodes.forEach(nd => {{ if(nd.x !== undefined) {{ nd.x += offsetX; nd.y += offsetY; }} }});
+
+// ── SVG rendering ──
+const svg = document.getElementById('graph-svg');
+const root = document.getElementById('graph-root');
+let transform = {{ x: 0, y: 0, scale: 1 }};
+
+function applyTransform() {{
+  root.setAttribute('transform', `translate(${{transform.x}},${{transform.y}}) scale(${{transform.scale}})`);
+}}
+
+function buildGraph() {{
+  root.innerHTML = '';
+
+  const nodeById = {{}};
+  graphNodes.forEach(nd => nodeById[nd.id] = nd);
+
+  // Build edge lists
+  const outEdges = {{}};
+  const inEdges  = {{}};
+  graphEdges.forEach((e, ei) => {{
+    if(!outEdges[e.src]) outEdges[e.src] = [];
+    if(!inEdges[e.dst])  inEdges[e.dst]  = [];
+    outEdges[e.src].push(ei);
+    inEdges[e.dst].push(ei);
+  }});
+
+  // Sort edges
+  Object.keys(outEdges).forEach(srcId => {{
+    outEdges[+srcId].sort((a, b) => {{
+      const da = nodeById[graphEdges[a].dst], db = nodeById[graphEdges[b].dst];
+      if(!da || !db) return 0;
+      return (da.x + NODE_W/2) - (db.x + NODE_W/2);
+    }});
+  }});
+  Object.keys(inEdges).forEach(dstId => {{
+    inEdges[+dstId].sort((a, b) => {{
+      const sa = nodeById[graphEdges[a].src], sb = nodeById[graphEdges[b].src];
+      if(!sa || !sb) return 0;
+      return (sa.x + NODE_W/2) - (sb.x + NODE_W/2);
+    }});
+  }});
+
+  function anchorX(nodeId, edgeIdx, side) {{
+    const nd = nodeById[nodeId];
+    if(!nd) return 0;
+    const list = side === 'out' ? (outEdges[nodeId] || []) : (inEdges[nodeId] || []);
+    const total = list.length;
+    if(total <= 1) return nd.x + NODE_W / 2;
+    const pos = list.indexOf(edgeIdx);
+    const margin = NODE_W * 0.10;
+    const span   = NODE_W - margin * 2;
+    return nd.x + margin + (pos / (total - 1)) * span;
+  }}
+
+  // Draw edges
+  const edgeG = document.createElementNS('http://www.w3.org/2000/svg','g');
+  edgeG.id = 'edges-g';
+  graphEdges.forEach((e, ei) => {{
+    const src = nodeById[e.src], dst = nodeById[e.dst];
+    if(!src || !dst || src.x === undefined || dst.x === undefined) return;
+
+    const sx = anchorX(e.src, ei, 'out');
+    const sy = src.y + NODE_H;
+    const dx = anchorX(e.dst, ei, 'in');
+    const dy = dst.y;
+
+    const levelSpan = (dst._level || 0) - (src._level || 0);
+    let pathD;
+
+    if(levelSpan > 1) {{
+      // Long edge: bypass routing
+      const goLeft = sx <= (src.x + NODE_W/2);
+      const bounds = {{minX: Infinity, maxX: -Infinity}};
+      for(let lv = src._level; lv <= dst._level; lv++) {{
+        graphNodes.forEach(nd => {{
+          if(nd._level === lv) {{
+            bounds.minX = Math.min(bounds.minX, nd.x);
+            bounds.maxX = Math.max(bounds.maxX, nd.x + NODE_W);
+          }}
+        }});
+      }}
+      if(!isFinite(bounds.minX)) bounds.minX = 0;
+      if(!isFinite(bounds.maxX)) bounds.maxX = 0;
+
+      const BYPASS_MARGIN = 18;
+      const STUB = 20;
+      if(goLeft) {{
+        const lx = bounds.minX - BYPASS_MARGIN - ei * 14;
+        pathD = `M${{sx}},${{sy}} L${{sx}},${{sy+STUB}} L${{lx}},${{sy+STUB}} L${{lx}},${{dy-STUB}} L${{dx}},${{dy-STUB}} L${{dx}},${{dy}}`;
+      }} else {{
+        const rx = bounds.maxX + BYPASS_MARGIN + ei * 14;
+        pathD = `M${{sx}},${{sy}} L${{sx}},${{sy+STUB}} L${{rx}},${{sy+STUB}} L${{rx}},${{dy-STUB}} L${{dx}},${{dy-STUB}} L${{dx}},${{dy}}`;
+      }}
+    }} else {{
+      // Short edge: simple bezier
+      const cp = Math.max(Math.abs(dy - sy) * 0.5, 30);
+      pathD = `M${{sx}},${{sy}} C${{sx}},${{sy + cp}} ${{dx}},${{dy - cp}} ${{dx}},${{dy}}`;
+    }}
+
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d', pathD);
+    path.setAttribute('class','edge-path');
+    path.setAttribute('data-src', e.src);
+    path.setAttribute('data-dst', e.dst);
+    edgeG.appendChild(path);
+  }});
+  root.appendChild(edgeG);
+
+  // Draw nodes
+  const nodeG = document.createElementNS('http://www.w3.org/2000/svg','g');
+  nodeG.id = 'nodes-g';
+  graphNodes.forEach((nd, i) => {{
+    if(nd.x === undefined) return;
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+    g.setAttribute('class','node-group');
+    g.setAttribute('data-id', nd.id);
+    g.setAttribute('transform', `translate(${{nd.x}},${{nd.y}})`);
+
+    const color = catColor(nd.category);
+
+    const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
+    rect.setAttribute('class','node-rect');
+    rect.setAttribute('width', NODE_W);
+    rect.setAttribute('height', NODE_H);
+    rect.setAttribute('fill', color+'22');
+    rect.setAttribute('stroke', color);
+    rect.setAttribute('rx', 8);
+    g.appendChild(rect);
+
+    const opText = document.createElementNS('http://www.w3.org/2000/svg','text');
+    opText.setAttribute('class','node-op');
+    opText.setAttribute('x', NODE_W/2);
+    opText.setAttribute('y', 18);
+    opText.textContent = nd.op.length > 15 ? nd.op.slice(0,14)+'…' : nd.op;
+    opText.setAttribute('fill', color);
+    g.appendChild(opText);
+
+    const nameText = document.createElementNS('http://www.w3.org/2000/svg','text');
+    nameText.setAttribute('class','node-name');
+    nameText.setAttribute('x', NODE_W/2);
+    nameText.setAttribute('y', 36);
+    const dispName = nd.name.length > 18 ? nd.name.slice(0,17)+'…' : nd.name;
+    nameText.textContent = dispName;
+    g.appendChild(nameText);
+
+    g.addEventListener('click', () => selectGraphNode(nd.id));
+    nodeG.appendChild(g);
+  }});
+  root.appendChild(nodeG);
+}}
+
+// ── Legend ──
+function buildLegend() {{
+  const usedCats = [...new Set(graphNodes.map(n => n.category))];
+  const leg = document.getElementById('legend-panel');
+  leg.innerHTML = usedCats.map(c =>
+    `<div class="legend-item"><div class="legend-dot" style="background:${{catColor(c)}}"></div><span>${{CAT_LABEL[c]||c}}</span></div>`
+  ).join('');
+}}
+
+// ── Node selection ──
+let selectedGraphNode = null;
+function selectGraphNode(nodeId) {{
+  // deselect previous
+  if(selectedGraphNode !== null) {{
+    const prev = root.querySelector(`[data-id="${{selectedGraphNode}}"] .node-rect`);
+    if(prev) prev.classList.remove('selected');
+  }}
+  // highlight edges
+  root.querySelectorAll('.edge-path').forEach(p => {{
+    p.classList.remove('highlighted');
+    p.setAttribute('marker-end','url(#arrow)');
+  }});
+
+  selectedGraphNode = nodeId;
+  const el = root.querySelector(`[data-id="${{nodeId}}"] .node-rect`);
+  if(el) el.classList.add('selected');
+
+  // highlight connected edges
+  root.querySelectorAll(`.edge-path[data-src="${{nodeId}}"], .edge-path[data-dst="${{nodeId}}"]`).forEach(p => {{
+    p.classList.add('highlighted');
+    p.setAttribute('marker-end','url(#arrow-hl)');
+  }});
+
+  const nd = graphNodes.find(n => n.id === nodeId);
+  if(nd) renderGraphNodeDetail(nd);
+  
+  // Show the detail panel
+  graphPanelVisible = true;
+  document.getElementById('graph-detail-panel').classList.add('visible');
+}}
+
+function renderGraphNodeDetail(nd) {{
+  const color = catColor(nd.category);
+
+  // 特殊处理Input和Output节点的类别标签
+  let categoryLabel = CAT_LABEL[nd.category] || nd.category;
+  if(nd.op === 'Input') categoryLabel = '输入';
+  if(nd.op === 'Output') categoryLabel = '输出';
+
+  let html = `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <div style="background:${{color}}33;border:1px solid ${{color}};border-radius:8px;padding:6px 14px;font-size:16px;font-weight:700;color:${{color}}">${{nd.op}}</div>
+    </div>
+    <div class="info-row"><div class="ik">节点名</div><div class="iv">${{nd.name}}</div></div>
+    <div class="info-row"><div class="ik">算子类型</div><div class="iv">${{nd.op}}</div></div>
+    <div class="info-row"><div class="ik">类别</div><div class="iv">${{categoryLabel}}</div></div>
+  `;
+
+  // Input Tensors - 显示输入张量名称和形状
+  if(nd.input_shapes && nd.input_shapes.length) {{
+    html += `<div class="section-title">输入张量</div>`;
+    nd.input_shapes.forEach(t => {{
+      html += `<div class="tensor-item">
+        <div style="color:var(--accent);font-weight:600">${{t.name}}</div>
+        <div style="color:var(--text2);margin-top:2px">${{t.shape}}</div>
+      </div>`;
+    }});
+  }} else if(nd.inputs && nd.inputs.length) {{
+    // 如果没有shape信息,至少显示tensor名称
+    html += `<div class="section-title">输入张量</div>`;
+    nd.inputs.forEach(name => {{
+      html += `<div class="tensor-item">
+        <div style="color:var(--accent);font-weight:600">${{name}}</div>
+        <div style="color:var(--text2);margin-top:2px">形状未知</div>
+      </div>`;
+    }});
+  }}
+
+  // Output Tensors - 显示输出张量名称和形状
+  if(nd.output_shapes && nd.output_shapes.length) {{
+    html += `<div class="section-title">输出张量</div>`;
+    nd.output_shapes.forEach(t => {{
+      html += `<div class="tensor-item">
+        <div style="color:var(--accent);font-weight:600">${{t.name}}</div>
+        <div style="color:var(--text2);margin-top:2px">${{t.shape}}</div>
+      </div>`;
+    }});
+  }} else if(nd.outputs && nd.outputs.length) {{
+    // 如果没有shape信息,至少显示tensor名称
+    html += `<div class="section-title">输出张量</div>`;
+    nd.outputs.forEach(name => {{
+      html += `<div class="tensor-item">
+        <div style="color:var(--accent);font-weight:600">${{name}}</div>
+        <div style="color:var(--text2);margin-top:2px">形状未知</div>
+      </div>`;
+    }});
+  }}
+
+  // Attributes
+  if(nd.attrs && Object.keys(nd.attrs).length) {{
+    html += `<div class="section-title">属性</div>`;
+    Object.entries(nd.attrs).forEach(([k,v]) => {{
+      html += `<div class="attr-item"><div class="attr-key">${{k}}</div><div class="attr-val">${{JSON.stringify(v)}}</div></div>`;
+    }});
+  }}
+
+  document.getElementById('graph-node-detail').innerHTML = html;
+}}
+
+// ── Pan & Zoom ──
+let isPanning = false, panStart = {{x:0, y:0}}, panOrigin = {{x:0, y:0}};
+const wrap = document.getElementById('canvas-wrap');
+
+wrap.addEventListener('mousedown', e => {{
+  if(e.target === svg || e.target === root || e.target.tagName === 'svg') {{
+    isPanning = true;
+    panStart = {{x: e.clientX, y: e.clientY}};
+    panOrigin = {{x: transform.x, y: transform.y}};
+    wrap.classList.add('grabbing');
+  }}
+}});
+window.addEventListener('mousemove', e => {{
+  if(!isPanning) return;
+  transform.x = panOrigin.x + (e.clientX - panStart.x);
+  transform.y = panOrigin.y + (e.clientY - panStart.y);
+  applyTransform();
+}});
+window.addEventListener('mouseup', () => {{ isPanning = false; wrap.classList.remove('grabbing'); }});
+
+wrap.addEventListener('wheel', e => {{
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.12 : 0.89;
+  const rect = svg.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  transform.x = mx - (mx - transform.x) * factor;
+  transform.y = my - (my - transform.y) * factor;
+  transform.scale *= factor;
+  applyTransform();
+}}, {{passive: false}});
+
+function zoomBy(f) {{
+  const rect = svg.getBoundingClientRect();
+  const cx = rect.width/2, cy = rect.height/2;
+  transform.x = cx - (cx - transform.x) * f;
+  transform.y = cy - (cy - transform.y) * f;
+  transform.scale *= f;
+  applyTransform();
+}}
+
+function fitView() {{
+  const rect = svg.getBoundingClientRect();
+  const scaleX = rect.width / (graphW + 80);
+  const scaleY = rect.height / (graphH + 80);
+  transform.scale = Math.min(scaleX, scaleY, 1);
+  transform.x = (rect.width - graphW * transform.scale) / 2;
+  transform.y = (rect.height - graphH * transform.scale) / 2;
+  applyTransform();
+}}
+
+// ── Search ──
+document.getElementById('graph-search').addEventListener('input', function() {{
+  const q = this.value.toLowerCase().trim();
+  root.querySelectorAll('.node-group').forEach(g => {{
+    const nodeId = parseInt(g.dataset.id);
+    const nd = graphNodes.find(n => n.id === nodeId);
+    if(!nd) return;
+    if(!q) {{ g.style.opacity = '1'; return; }}
+    const match = nd.op.toLowerCase().includes(q) || nd.name.toLowerCase().includes(q);
+    g.style.opacity = match ? '1' : '0.15';
+  }});
+}});
+
+let graphPanelVisible = false;
+function toggleGraphPanel() {{
+  graphPanelVisible = !graphPanelVisible;
+  const panel = document.getElementById('graph-detail-panel');
+  if(graphPanelVisible) {{
+    panel.classList.add('visible');
+  }} else {{
+    panel.classList.remove('visible');
+  }}
+}}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TAB SWITCHING
+// ═══════════════════════════════════════════════════════════════════════════
+
 function switchTab(t){{
   document.getElementById("tab-debug").classList.toggle("active", t==="debug");
+  document.getElementById("tab-graph").classList.toggle("active", t==="graph");
   document.getElementById("tab-stats").classList.toggle("active", t==="stats");
+  
   document.getElementById("list-panel").style.display = t==="debug"?"flex":"none";
   document.getElementById("detail-panel").style.display = t==="debug"?"block":"none";
   document.getElementById("stats-panel").classList.toggle("active", t==="stats");
+  document.getElementById("graph-panel").classList.toggle("active", t==="graph");
+  
+  const graphDetailPanel = document.getElementById('graph-detail-panel');
+  if(t === "graph" && graphPanelVisible) {{
+    graphDetailPanel.classList.add('visible');
+  }} else {{
+    graphDetailPanel.classList.remove('visible');
+  }}
+  
   if(t==="stats") buildStats();
+  if(t==="graph") {{ buildGraph(); buildLegend(); setTimeout(fitView, 50); }}
 }}
 
 // ── init ─────────────────────────────────────────────────────────────────────
